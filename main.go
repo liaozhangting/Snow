@@ -3,8 +3,12 @@
 // Java对照: 类似于 Spring Boot 的 Application 启动类
 // 1. 初始化配置
 // 2. 建立 gRPC 长连接
-// 3. 模拟产生日志并流式发送
-// 4. 支持优雅退出
+// 3. 初始化 Pool 和 Batcher
+// 4. 模拟产生日志并流式发送
+// 5. 支持优雅退出
+//
+// 数据流: 模拟任务 ──► Pool ──► Batcher ──► gRPC批量发送
+//          (生产)    (并发)    (缓冲聚合)  (网络IO)
 package main
 
 import (
@@ -17,7 +21,9 @@ import (
 	"time"
 
 	"github.com/liaozhangting/Snow/api"
+	"github.com/liaozhangting/Snow/buffer"
 	"github.com/liaozhangting/Snow/config"
+	"github.com/liaozhangting/Snow/worker"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -32,6 +38,8 @@ func main() {
 	// 2. 加载配置（遵循规范 6.0）
 	cfg := config.LoadEdgeConfig()
 	log.Printf("[Edge] 雪毛儿正在启动，ID: %s, 目标云端: %s", cfg.DeviceID, cfg.CloudAddr)
+	log.Printf("[Edge] 配置: WorkerCount=%d, QueueSize=%d, BatchSize=%d, FlushInterval=%v, TaskCount=%d",
+		cfg.WorkerCount, cfg.QueueSize, cfg.BatchSize, cfg.FlushInterval, cfg.TaskCount)
 
 	// 3. 建立 gRPC 连接（遵循规范 4.2）
 	conn, err := grpc.Dial(cfg.CloudAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -46,54 +54,81 @@ func main() {
 
 	client := api.NewLogServiceClient(conn)
 
-	// 4. 开启流式发送
-	stream, err := client.UploadLogs(ctx)
-	if err != nil {
-		log.Fatalf("开启日志流失败: %v", err)
-	}
+	// 4. 初始化 Batcher（批量缓冲）
+	var stream api.LogService_UploadLogsClient
+	var streamMu sync.Mutex
 
-	// 5. 准备信号捕获和 WaitGroup（遵循规范 2.1）
-	var wg sync.WaitGroup
+	batcher := buffer.NewBatcher(cfg.BatchSize, cfg.FlushInterval,
+		func(ctx context.Context, logs []*api.LogRequest) error {
+			streamMu.Lock()
+			defer streamMu.Unlock()
+
+			if stream == nil {
+				var err error
+				stream, err = client.UploadLogs(ctx)
+				if err != nil {
+					log.Printf("[Edge] 开启日志流失败: %v", err)
+					return err
+				}
+			}
+
+			for _, log := range logs {
+				if err := stream.Send(log); err != nil {
+					log.Printf("[Edge] 发送日志失败: %v", err)
+					stream = nil // 重置流
+					return err
+				}
+			}
+			return nil
+		})
+	batcher.Start()
+	defer batcher.Stop()
+
+	// 5. 初始化 Pool（Goroutine 池）
+	pool := worker.NewPool(cfg.WorkerCount, cfg.QueueSize)
+	pool.Start()
+	defer pool.Stop()
+
+	// 6. 准备信号捕获（遵循规范 2.1）
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 
-	// 6. 模拟雪毛儿的日志产出
+	// 7. 模拟雪毛儿的任务产出
+	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer func() {
-			if reply, err := stream.CloseAndRecv(); err != nil {
-				if status.Code(err) == codes.Canceled {
-					log.Println("[Edge] 流已关闭， 未等待云端响应（正常退出）")
-				} else {
-					log.Printf("[Edge] 接收云端响应失败： %v", err)
-				}
-			} else {
-				log.Printf("云端确认: %s", reply.Message)
-			}
-		}()
-		// 模拟雪毛儿无限产出日志
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		log.Println("[Edge] 开始模拟日志产出")
-		for {
+		log.Printf("[Edge] 开始模拟 %d 个推理任务...", cfg.TaskCount)
+
+		for i := 0; i < cfg.TaskCount; i++ {
 			select {
-			case <-ticker.C:
-				msg := &api.LogRequest{
+			case <-ctx.Done():
+				log.Printf("[Edge] 任务生产被中断，已生产 %d 个任务", i)
+				return
+			default:
+				logReq := &api.LogRequest{
 					DeviceId:  cfg.DeviceID,
 					Content:   "雪毛儿正在运行推理任务...",
 					LogLevel:  "INFO",
 					Timestamp: time.Now().UnixMilli(),
 				}
-				stream.Send(msg)
-			case <-ctx.Done():
-				log.Printf("[Edge] 日志生产 Goroutine 收到退出信号，停止发送")
-				return
+
+				task := worker.Task{Log: logReq}
+				if err := pool.Submit(task); err != nil {
+					log.Printf("[Edge] 提交任务失败: %v", err)
+				} else {
+					// 任务提交成功，写入 Batcher
+					batcher.Add(logReq)
+				}
+
+				// 稍微控制一下生产速度
+				time.Sleep(100 * time.Microsecond)
 			}
 		}
+		log.Printf("[Edge] 任务生产完成，共 %d 个任务", cfg.TaskCount)
 	}()
 
-	// 7. 等待信号（遵循规范 2.1）
+	// 8. 等待信号（遵循规范 2.1）
 	select {
 	case <-signalChan:
 		log.Printf("[Edge] 收到退出信号，开始优雅退出...")
@@ -102,7 +137,24 @@ func main() {
 		log.Printf("[Edge] Context 已取消")
 	}
 
-	// 8. 等待所有 Goroutine 退出
+	// 9. 优雅退出顺序：先关Pool（停止生产）-> 再关Batcher（刷盘）-> 最后关gRPC
 	wg.Wait()
+	log.Printf("[Edge] Pool已处理 %d 个任务", pool.Processed())
+
+	// 手动关闭 gRPC 流
+	streamMu.Lock()
+	if stream != nil {
+		if reply, err := stream.CloseAndRecv(); err != nil {
+			if status.Code(err) == codes.Canceled {
+				log.Println("[Edge] 流已关闭，未等待云端响应（正常退出）")
+			} else {
+				log.Printf("[Edge] 接收云端响应失败: %v", err)
+			}
+		} else {
+			log.Printf("云端确认: %s", reply.Message)
+		}
+	}
+	streamMu.Unlock()
+
 	log.Println("[Edge] 优雅退出完成")
 }
