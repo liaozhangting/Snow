@@ -19,7 +19,9 @@ import (
 	"github.com/liaozhangting/Snow/api"
 	"github.com/liaozhangting/Snow/config"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -61,29 +63,32 @@ func main() {
 		defer wg.Done()
 		defer func() {
 			if reply, err := stream.CloseAndRecv(); err != nil {
-				log.Printf("接收云端响应失败: %v", err)
+				if status.Code(err) == codes.Canceled {
+					log.Println("[Edge] 流已关闭， 未等待云端响应（正常退出）")
+				} else {
+					log.Printf("[Edge] 接收云端响应失败： %v", err)
+				}
 			} else {
 				log.Printf("云端确认: %s", reply.Message)
 			}
 		}()
-
-		for i := 0; i < 5; i++ {
+		// 模拟雪毛儿无限产出日志
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		log.Println("[Edge] 开始模拟日志产出")
+		for {
 			select {
-			case <-ctx.Done():
-				log.Printf("[Edge] 日志生产 Goroutine 收到退出信号，停止发送")
-				return
-			default:
+			case <-ticker.C:
 				msg := &api.LogRequest{
 					DeviceId:  cfg.DeviceID,
 					Content:   "雪毛儿正在运行推理任务...",
 					LogLevel:  "INFO",
 					Timestamp: time.Now().UnixMilli(),
 				}
-				if err := stream.Send(msg); err != nil {
-					log.Printf("发送日志失败: %v", err)
-					return
-				}
-				time.Sleep(1 * time.Second)
+				stream.Send(msg)
+			case <-ctx.Done():
+				log.Printf("[Edge] 日志生产 Goroutine 收到退出信号，停止发送")
+				return
 			}
 		}
 	}()

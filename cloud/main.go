@@ -13,8 +13,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/liaozhangting/Snow/api"
 )
@@ -27,6 +30,7 @@ type LogServer struct {
 // UploadLogs 接收客户端流式日志
 func (s *LogServer) UploadLogs(stream api.LogService_UploadLogsServer) error {
 	count := 0
+	deviceId := "unknown"
 	log.Printf("[Cloud] 新的边缘端连接建立")
 
 	for {
@@ -44,11 +48,16 @@ func (s *LogServer) UploadLogs(stream api.LogService_UploadLogsServer) error {
 			// 1. Context 超时 (DeadlineExceeded)
 			// 2. 客户端强制断开 (Canceled)
 			// 3. 网络错误
-			log.Printf("[Cloud] 接收终止: %v", err)
+			if status.Code(err) == codes.Canceled {
+				log.Printf("[Cloud] 客户端 [%s] 主动断开", deviceId)
+			} else {
+				log.Printf("[Cloud] 接收错误： %v", err)
+			}
 			return err
 		}
 
 		count++
+		deviceId = req.DeviceId
 		log.Printf("[Cloud] 收到 [%s]的日志: %s", req.DeviceId, req.Content)
 	}
 }
@@ -65,7 +74,20 @@ func main() {
 	// 3. 启动Goroutine处理信号
 	go func() {
 		<-sigChan
-		log.Println("[Cloud] 正在优雅关闭...")
+		log.Println("[Cloud] 正在优雅关闭(最多五秒）...")
+
+		done := make(chan struct{})
+		go func() {
+			s.GracefulStop()
+			close(done)
+		}()
+		select {
+		case <-done:
+			log.Println("[Cloud] 优雅关闭完成")
+		case <-time.After(5 * time.Second):
+			log.Println("[Cloud] 优雅关闭超时，强制关闭")
+			s.Stop()
+		}
 		s.GracefulStop()
 		log.Println("[Cloud] 已退出")
 	}()
