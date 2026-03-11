@@ -10,6 +10,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"google.golang.org/grpc"
 
@@ -27,37 +30,57 @@ func (s *LogServer) UploadLogs(stream api.LogService_UploadLogsServer) error {
 	log.Printf("[Cloud] 新的边缘端连接建立")
 
 	for {
+		// 直接调用 Recv，它会阻塞等待，或者在超时/断开时返回错误
 		req, err := stream.Recv()
+
 		if err == io.EOF {
-			// 客户端发送完毕
-			log.Printf("[Cloud] 连接关闭，共接收 %d 条日志", count)
-			return stream.SendAndClose(&api.LogResponse{
-				Message:       "接收成功",
-				ReceivedCount: int32(count),
-			})
+			// 客户端主动正常关闭 (CloseSend)
+			log.Printf("[Cloud] 连接正常关闭，接收到 %d 条", count)
+			return stream.SendAndClose(&api.LogResponse{Message: "接收成功"})
 		}
+
 		if err != nil {
-			log.Printf("[Cloud] 接收错误: %v", err)
+			// 这里包含了多种情况：
+			// 1. Context 超时 (DeadlineExceeded)
+			// 2. 客户端强制断开 (Canceled)
+			// 3. 网络错误
+			log.Printf("[Cloud] 接收终止: %v", err)
 			return err
 		}
 
 		count++
-		log.Printf("[Cloud] 收到日志 [%s]: %s", req.DeviceId, req.Content)
+		log.Printf("[Cloud] 收到 [%s]的日志: %s", req.DeviceId, req.Content)
 	}
 }
 
 func main() {
-	addr := ":50051"
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("监听失败: %v", err)
-	}
+	// 1. 监听信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// 2. 创建gRPC Server
 	s := grpc.NewServer()
 	api.RegisterLogServiceServer(s, &LogServer{})
 
+	// 3. 启动Goroutine处理信号
+	go func() {
+		<-sigChan
+		log.Println("[Cloud] 正在优雅关闭...")
+		s.GracefulStop()
+		log.Println("[Cloud] 已退出")
+	}()
+
+	// 4. 启动监听（只保留这一段，加错误处理）
+	addr := ":50051"
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[Cloud] 监听失败: %v", err)
+	}
+
 	log.Printf("[Cloud] 雪毛儿云端启动，监听 %s", addr)
+
+	// 5. 阻塞主线程
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("服务启动失败: %v", err)
+		log.Fatalf("[Cloud] 服务启动失败: %v", err)
 	}
 }
