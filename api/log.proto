@@ -1,0 +1,23 @@
+syntax = "proto3";
+package api;
+
+option go_package = "github.com/liaozhangting/Snow/api";
+
+// 日志请求
+message LogRequest {
+  string device_id = 1;
+  string content = 2;
+  string log_level = 3;
+  int64 timestamp = 4;
+}
+
+// 云端响应
+message LogResponse {
+  string message = 1;
+  int32 received_count = 2;
+}
+
+service LogService {
+  // 客户端流式上传日志
+  rpc UploadLogs(stream LogRequest) returns (LogResponse);
+}

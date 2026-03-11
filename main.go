@@ -1,20 +1,66 @@
+// Package main 是雪毛儿边缘端的启动入口
+//
+// Java对照: 类似于 Spring Boot 的 Application 启动类
+// 1. 初始化配置
+// 2. 建立 gRPC 长连接
+// 3. 模拟产生日志并流式发送
 package main
 
 import (
-	"fmt"
+	"context"
+	"log"
+	"time"
+
+	"github.com/liaozhangting/Snow/api"
+	"github.com/liaozhangting/Snow/config" // 假设你已按照规范 6.0 创建
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
 func main() {
-	//TIP <p>Press <shortcut actionId="ShowIntentionActions"/> when your caret is at the underlined text
-	// to see how GoLand suggests fixing the warning.</p><p>Alternatively, if available, click the lightbulb to view possible fixes.</p>
-	s := "gopher"
-	fmt.Printf("Hello and welcome, %s!\n", s)
+	// 1. 加载配置 (遵循规范 6.0)
+	cfg := config.LoadEdgeConfig()
+	log.Printf("[Edge] 雪毛儿正在启动，ID: %s, 目标云端: %s", cfg.DeviceID, cfg.CloudAddr)
 
-	for i := 1; i <= 5; i++ {
-		//TIP <p>To start your debugging session, right-click your code in the editor and select the Debug option.</p> <p>We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-		// for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.</p>
-		fmt.Println("i =", 100/i)
+	// 2. 建立 gRPC 连接 (遵循规范 4.2)
+	conn, err := grpc.Dial(cfg.CloudAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("连接云端失败: %v", err)
 	}
+	defer conn.Close()
+
+	client := api.NewLogServiceClient(conn)
+
+	// 3. 开启流式发送
+	stream, err := client.UploadLogs(context.Background())
+	if err != nil {
+		log.Fatalf("开启日志流失败: %v", err)
+	}
+
+	// 4. 模拟雪毛儿的日志产出
+	go func() {
+		for i := 0; i < 5; i++ {
+			msg := &api.LogRequest{
+				DeviceId: cfg.DeviceID,
+				Content:  "雪毛儿正在运行推理任务...",
+				LogLevel: "INFO",
+			}
+			if err := stream.Send(msg); err != nil {
+				log.Printf("发送日志失败: %v", err)
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+
+		// 发送完毕，关闭流
+		reply, err := stream.CloseAndRecv()
+		if err != nil {
+			log.Printf("接收云端响应失败: %v", err)
+		} else {
+			log.Printf("云端确认: %s", reply.Message)
+		}
+	}()
+
+	// 阻塞主进程，模拟持续运行
+	select {}
 }
