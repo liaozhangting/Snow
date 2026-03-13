@@ -8,7 +8,8 @@
 // 5. 支持优雅退出
 //
 // 数据流: 模拟任务 ──► Pool ──► Batcher ──► gRPC批量发送
-//          (生产)    (并发)    (缓冲聚合)  (网络IO)
+//
+//	(生产)    (并发)    (缓冲聚合)  (网络IO)
 package main
 
 import (
@@ -58,24 +59,17 @@ func main() {
 	var stream api.LogService_UploadLogsClient
 	var streamMu sync.Mutex
 
+	// main.go 里， Batcher之前创建流
+	stream, err = client.UploadLogs(ctx)
+	if err != nil {
+		log.Fatalf("创建流失败： %v", err)
+	}
+	defer stream.CloseSend()
 	batcher := buffer.NewBatcher(cfg.BatchSize, cfg.FlushInterval,
 		func(ctx context.Context, logs []*api.LogRequest) error {
-			streamMu.Lock()
-			defer streamMu.Unlock()
-
-			if stream == nil {
-				var err error
-				stream, err = client.UploadLogs(ctx)
-				if err != nil {
-					log.Printf("[Edge] 开启日志流失败: %v", err)
-					return err
-				}
-			}
-
-			for _, log := range logs {
-				if err := stream.Send(log); err != nil {
+			for _, l := range logs {
+				if err := stream.Send(l); err != nil {
 					log.Printf("[Edge] 发送日志失败: %v", err)
-					stream = nil // 重置流
 					return err
 				}
 			}
@@ -137,11 +131,14 @@ func main() {
 		log.Printf("[Edge] Context 已取消")
 	}
 
-	// 9. 优雅退出顺序：先关Pool（停止生产）-> 再关Batcher（刷盘）-> 最后关gRPC
+	// 9. 优雅退出顺序(手动控制）
 	wg.Wait()
 	log.Printf("[Edge] Pool已处理 %d 个任务", pool.Processed())
 
-	// 手动关闭 gRPC 流
+	//  先关Batcher（刷盘） ，此时 conn 还开着
+	batcher.Stop()
+
+	// 再关流
 	streamMu.Lock()
 	if stream != nil {
 		if reply, err := stream.CloseAndRecv(); err != nil {
